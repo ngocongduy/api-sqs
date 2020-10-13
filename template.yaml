@@ -1,0 +1,240 @@
+Transform: AWS::Serverless-2016-10-31
+
+Description: API -> Lambda send message to SQS -> Trigger Lambda worker
+
+Parameters:
+  CorsOrigin:
+    Description: Header Access-Control-Allow-Origin
+    Default: "'http://localhost:3000'"
+    Type: String
+  CorsMethods:
+    Description: Header Access-Control-Allow-Headers
+    Default: "'*'"
+    Type: String
+  CorsHeaders:
+    Description: Header Access-Control-Allow-Headers
+    Default: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+    Type: String
+  SwaggerS3File:
+    Description: 'S3 "swagger.yaml" file location'
+    Default: "./swagger_api_sqs.yaml"
+    Type: String
+
+Globals:
+  Function:
+    Timeout: 60
+    Runtime: python3.6
+    MemorySize: 512
+
+Resources:
+  LambdaRoleForSendAndReceiveSQS:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: WriteCloudWatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: FullAccessSQS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:*'
+                Resource: '*'              
+
+  ApiGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Join ["", ["/", !Ref "AWS::StackName", "/"]]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowApiGatewayServiceToAssumeRole
+            Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "lambda:InvokeFunction"
+                Resource: arn:aws:lambda:*:*:*
+        - PolicyName: WriteCloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+#  SQSPolicy:
+#    Type: AWS::SQS::QueuePolicy
+#    Properties:
+#      PolicyDocument:
+#        Id: MyQueuePolicy
+#        Version: '2012-10-17'
+#        Statement:
+#          - Sid: Full-allow
+#            Effect: Allow
+#            Principal:
+#              AWS: '*'
+#            Action:
+#              - 'sqs:*'
+#            Resource: '*'
+#      Queues:
+#        - !Ref QueueForAPI
+#        - !Ref DLQForQueueForAPI
+
+  QueueForAPI:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: QueueForAPI.fifo
+      MessageRetentionPeriod: 1000
+      DelaySeconds: 0
+      FifoQueue: true
+      MaximumMessageSize: 1024 #1kB -> 256kB
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt
+          - DLQForQueueForAPI
+          - Arn
+        maxReceiveCount: 2
+      ContentBasedDeduplication: True
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 1
+    #KmsDataKeyReusePeriodSeconds: Integer
+    #KmsMasterKeyId: String
+    #QueueName: ${self:service}-${self:provider.stage}-RDSDatabase
+    #Tags:
+    #  - Tag
+
+  DLQForQueueForAPI:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DLQForQueueForAPI.fifo
+      MessageRetentionPeriod: 100000
+      DelaySeconds: 0
+      FifoQueue: true
+      MaximumMessageSize: 1024 #1kB -> 256kB
+      ReceiveMessageWaitTimeSeconds: 1
+
+#  LambdaSendMessageToQueuePolicy:
+#    Type: AWS::SQS::QueuePolicy
+#    Properties:
+#      PolicyDocument:
+#        Version: "2012-10-17"
+#        Statement:
+#          - Sid: "allow-lambda-messages"
+#            Effect: Allow
+#            Principal: "*"
+#            Resource: !GetAtt
+#              - LambdaSendMessageToQueue
+#              - Arn
+#            Action:
+#              - SQS:SendMessage
+#              - SQS:ReceiveMessage
+#            Condition:
+#              ArnEquals:
+#                "aws:SourceArn": !Ref LambdaSendMessageToQueue OR !Ref LambdaReceiveMessageToQueue
+#      Queues:
+#        - Ref: QueueForAPI
+
+  # EventMappingCallAPIQueue:
+  #   Type: AWS::Lambda::EventSourceMapping
+  #   Properties: 
+  #     BatchSize: 1
+  #     Enabled: true
+  #     EventSourceArn: !GetAtt QueueCallAPI.Arn
+  #     FunctionName: !GetAtt CallAPIFunction.Arn
+      #BisectBatchOnFunctionError: Boolean
+      #DestinationConfig: 
+      #  DestinationConfig
+      #MaximumBatchingWindowInSeconds: Integer
+      #MaximumRecordAgeInSeconds: Integer
+      #MaximumRetryAttempts: Integer
+      #ParallelizationFactor: Integer
+      #StartingPosition: String
+      #Topics: 
+      #  - String
+
+  LambdaSendMessageToQueue:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-send-message
+      CodeUri: functions/sqs_send/
+      Handler: app.lambda_handler
+      Description: Send message to queue
+      Role: !GetAtt LambdaRoleForSendAndReceiveSQS.Arn
+      Timeout: 20
+
+  LambdaReceiveMessageFromQueue:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-receive-message
+      CodeUri: functions/sqs_receive/
+      Handler: app.lambda_handler
+      Description: Consume message from queue
+  #      vpc: ... # our VPC info so we can connect to RDS
+      Role: !GetAtt LambdaRoleForSendAndReceiveSQS.Arn
+      Layers:
+        - !Ref LambdaLayerSOAP
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt QueueForAPI.Arn
+            BatchSize: 5 # Should lower or equal than lambda consumer
+            Enabled: true
+
+  LambdaLayerSOAP:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.6
+      Content:
+        S3Bucket: handmade-lambda-layers #my-bucket-us-west-2-123456789012
+        S3Key: requests-lxml-zeep.zip
+      Description: Include module requests, lxml, zeep for soap
+      LayerName: soap-python36
+      LicenseInfo: MIT
+
+
+  InboundAPIForQueue:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Name: !Sub ${AWS::StackName}-api
+      DefinitionBody:
+        'Fn::Transform':
+          Name: AWS::Include
+          Parameters:
+            # s3 location of the swagger file
+            Location: s3://my-api-documents/swagger_api_sqs.yaml
+
+
+
+
+
